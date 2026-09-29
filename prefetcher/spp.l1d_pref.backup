@@ -1,0 +1,233 @@
+#include "cache.h"
+
+// =====================================================
+// Stride Pattern Prefetcher (SPP)
+// 
+// Features:
+//   1. Per-IP tracking with LRU eviction
+//   2. Dual pattern classification:
+//      - Uniform strides (priority) via confidence counter
+//      - Non-uniform repeating patterns via per-IP signature-based PHT
+//   3. Accuracy-based throttling using a circular buffer
+//      of recently issued prefetch addresses
+// =====================================================
+
+// --- Tunable parameters (for sensitivity analysis) ---
+#define IP_TRACKER_COUNT       24
+#define PREFETCH_DEGREE_MAX    4
+#define PREFETCH_DEGREE_MIN    1
+#define HIGH_ACCURACY_THRESH   70
+#define LOW_ACCURACY_THRESH    40
+#define UNIFORM_CONF_THRESH    2     // confidence >= this → uniform mode
+#define UNIFORM_CONF_MAX       4     // saturating counter ceiling
+#define SIGNATURE_TABLE_SIZE   16    // per-IP PHT size (must be power of 2)
+#define ACCURACY_DECAY_THRESH  1024  // right-shift counters after this many issued
+#define RECENT_PF_BUF_SIZE     256   // circular buffer for accuracy tracking
+#define MASK_IP                0xFF
+
+// --- Global accuracy tracking ---
+uint64_t spp_total_issued = 0;
+uint64_t spp_useful_hits  = 0;
+uint64_t spp_recent_pf_buf[RECENT_PF_BUF_SIZE];
+int      spp_recent_pf_head = 0;
+
+class IP_TRACKER {
+  public:
+    uint64_t ip;
+    uint64_t last_cl_addr;
+    int64_t  last_stride;
+    uint32_t lru;
+
+    // Saturating confidence counter for uniform stride detection.
+    // When >= UNIFORM_CONF_THRESH, we trust the uniform stride.
+    // When it drops below, we transition/fallback to non-uniform PHT.
+    uint32_t uniform_confidence;
+
+    // Signature: encodes recent stride history for non-uniform pattern lookup
+    uint32_t signature;
+
+    // Per-IP Pattern History Table: signature → predicted next stride.
+    // Isolated per-IP to prevent cross-instruction aliasing.
+    int64_t  pht[SIGNATURE_TABLE_SIZE];
+
+    IP_TRACKER () {
+        ip = 0;
+        last_cl_addr = 0;
+        last_stride = 0;
+        uniform_confidence = 0;
+        signature = 0;
+        lru = 0;
+        for (int i = 0; i < SIGNATURE_TABLE_SIZE; i++)
+            pht[i] = 0;
+    };
+};
+
+IP_TRACKER trackers[IP_TRACKER_COUNT];
+
+void CACHE::l1d_prefetcher_initialize() 
+{
+    cout << "CPU " << cpu << " L1D Stride Pattern Prefetcher (SPP)" << endl;
+    cout << "  DEGREE_MAX=" << PREFETCH_DEGREE_MAX
+         << " HIGH_ACC=" << HIGH_ACCURACY_THRESH
+         << " LOW_ACC=" << LOW_ACCURACY_THRESH
+         << " CONF_THRESH=" << UNIFORM_CONF_THRESH
+         << " PHT_SIZE=" << SIGNATURE_TABLE_SIZE << endl;
+
+    for (int i = 0; i < IP_TRACKER_COUNT; i++)
+        trackers[i].lru = i;
+    for (int i = 0; i < RECENT_PF_BUF_SIZE; i++)
+        spp_recent_pf_buf[i] = 0;
+}
+
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
+{
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+
+    // ---- Accuracy feedback ----
+    // Check if this demand access hits a recently issued prefetch
+    for (int i = 0; i < RECENT_PF_BUF_SIZE; i++) {
+        if (spp_recent_pf_buf[i] == cl_addr) {
+            spp_useful_hits++;
+            spp_recent_pf_buf[i] = 0; // prevent double-counting
+            break;
+        }
+    }
+
+    ip = ip & MASK_IP;
+
+    // ---- Find or allocate tracker ----
+    int index = -1;
+    for (index = 0; index < IP_TRACKER_COUNT; index++) {
+        if (trackers[index].ip == ip)
+            break;
+    }
+
+    if (index == IP_TRACKER_COUNT) {
+        // Evict LRU tracker
+        for (index = 0; index < IP_TRACKER_COUNT; index++) {
+            if (trackers[index].lru == (IP_TRACKER_COUNT - 1))
+                break;
+        }
+        trackers[index].ip = ip;
+        trackers[index].last_cl_addr = cl_addr;
+        trackers[index].last_stride = 0;
+        trackers[index].uniform_confidence = 0;
+        trackers[index].signature = 0;
+        for (int i = 0; i < SIGNATURE_TABLE_SIZE; i++)
+            trackers[index].pht[i] = 0;
+
+        for (int i = 0; i < IP_TRACKER_COUNT; i++) {
+            if (trackers[i].lru < trackers[index].lru)
+                trackers[i].lru++;
+        }
+        trackers[index].lru = 0;
+        return;
+    }
+
+    if (index == -1)
+        assert(0);
+
+    // ---- Compute stride ----
+    int64_t stride = 0;
+    if (cl_addr > trackers[index].last_cl_addr)
+        stride = cl_addr - trackers[index].last_cl_addr;
+    else {
+        stride = trackers[index].last_cl_addr - cl_addr;
+        stride *= -1;
+    }
+
+    if (stride == 0)
+        return;
+
+    // ---- Update uniform confidence (state transition logic) ----
+    // Confidence counter acts as a state machine:
+    //   >= UNIFORM_CONF_THRESH → UNIFORM mode (use stride directly)
+    //   <  UNIFORM_CONF_THRESH → NON-UNIFORM mode (fall back to PHT)
+    if (stride == trackers[index].last_stride) {
+        if (trackers[index].uniform_confidence < UNIFORM_CONF_MAX)
+            trackers[index].uniform_confidence++;
+    } else {
+        if (trackers[index].uniform_confidence > 0)
+            trackers[index].uniform_confidence--;
+    }
+
+    // ---- Predict next stride ----
+    // Priority: uniform stride first; if confidence is low, use PHT
+    int64_t pred_stride = 0;
+    if (trackers[index].uniform_confidence >= UNIFORM_CONF_THRESH) {
+        pred_stride = stride;  // uniform pattern
+    } else {
+        pred_stride = trackers[index].pht[trackers[index].signature]; // non-uniform fallback
+    }
+
+    // ---- Accuracy-based throttling ----
+    int current_degree = PREFETCH_DEGREE_MIN;
+    if (spp_total_issued > 16) {
+        uint64_t accuracy = (spp_useful_hits * 100) / spp_total_issued;
+        if (accuracy > HIGH_ACCURACY_THRESH) {
+            current_degree = PREFETCH_DEGREE_MAX;
+        } else if (accuracy > LOW_ACCURACY_THRESH) {
+            current_degree = PREFETCH_DEGREE_MAX - 1;
+        } else {
+            current_degree = PREFETCH_DEGREE_MIN;
+        }
+    }
+
+    // Decay counters so accuracy adapts to phase changes
+    if (spp_total_issued > ACCURACY_DECAY_THRESH) {
+        spp_total_issued >>= 1;
+        spp_useful_hits  >>= 1;
+    }
+
+    // ---- Issue prefetches ----
+    if (pred_stride != 0) {
+        for (int i = 0; i < current_degree; i++) {
+            uint64_t pf_address = (cl_addr + (pred_stride * (i + 1))) << LOG2_BLOCK_SIZE;
+
+            // Don't cross page boundary
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                break;
+
+            // MSHR-aware fill level selection
+            if (MSHR.occupancy < (MSHR.SIZE >> 1))
+                prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+            else
+                prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+
+            // Record for accuracy tracking
+            spp_total_issued++;
+            spp_recent_pf_buf[spp_recent_pf_head] = pf_address >> LOG2_BLOCK_SIZE;
+            spp_recent_pf_head = (spp_recent_pf_head + 1) % RECENT_PF_BUF_SIZE;
+        }
+    }
+
+    // ---- Train PHT and update signature ----
+    // Train: current signature → observed stride
+    trackers[index].pht[trackers[index].signature] = stride;
+    // Update signature by folding in the current stride
+    trackers[index].signature = ((trackers[index].signature << 1) ^ ((uint64_t)stride & (SIGNATURE_TABLE_SIZE - 1))) & (SIGNATURE_TABLE_SIZE - 1);
+
+    trackers[index].last_cl_addr = cl_addr;
+    trackers[index].last_stride  = stride;
+
+    // Update LRU
+    for (int i = 0; i < IP_TRACKER_COUNT; i++) {
+        if (trackers[i].lru < trackers[index].lru)
+            trackers[i].lru++;
+    }
+    trackers[index].lru = 0;
+}
+
+void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
+{
+    return;
+}
+
+void CACHE::l1d_prefetcher_final_stats()
+{
+    cout << "CPU " << cpu << " L1D SPP final stats" << endl;
+    cout << "  SPP Total Issued:     " << spp_total_issued << endl;
+    cout << "  SPP Useful Hits:      " << spp_useful_hits << endl;
+    if (spp_total_issued > 0)
+        cout << "  SPP Internal Accuracy: " << (spp_useful_hits * 100.0 / spp_total_issued) << "%" << endl;
+}

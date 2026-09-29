@@ -1,24 +1,298 @@
 #include "cache.h"
 
+// =====================================================
+// Stride Pattern Prefetcher (SPP) v3
+//
+// IPCP-style IP classification with Local Delta History:
+//   1. Each IP classified as NONE / CONSTANT_STRIDE / COMPLEX_STRIDE
+//   2. Constant stride: 2-bit confidence hysteresis, predicts uniform stride
+//   3. Complex stride: searches the local delta history buffer for
+//      repeating cycles and walks the cycle for multi-stride prefetching
+//   4. Accuracy-based throttling via circular buffer
+//
+// NO signature hash or PHT — uses direct cycle detection instead.
+// =====================================================
 
-void CACHE::l1d_prefetcher_initialize() 
+// --- Tunable parameters ---
+#define IP_TRACKER_COUNT       24
+#define PREFETCH_DEGREE_MAX    4
+#define PREFETCH_DEGREE_MIN    1
+#define HIGH_ACCURACY_THRESH   70
+#define LOW_ACCURACY_THRESH    40
+#define CS_CONF_THRESH         2     // confidence >= this → constant stride mode
+#define CS_CONF_MAX            3     // 2-bit saturating counter
+#define DELTA_HISTORY_LEN      8     // local delta history buffer per IP
+#define ACCURACY_DECAY_THRESH  1024
+#define RECENT_PF_BUF_SIZE     256
+#define MASK_IP                0xFF
+
+// IP classification states
+#define CLASS_NONE      0
+#define CLASS_CS        1  // Constant Stride
+#define CLASS_CPLX      2  // Complex (non-uniform) Stride
+
+// --- Global accuracy tracking ---
+uint64_t spp_total_issued = 0;
+uint64_t spp_useful_hits  = 0;
+uint64_t spp_recent_pf_buf[RECENT_PF_BUF_SIZE];
+int      spp_recent_pf_head = 0;
+
+class IP_TRACKER {
+  public:
+    uint64_t  ip;
+    uint64_t  last_cl_addr;
+    int64_t   last_stride;
+    uint32_t  lru;
+
+    // IP classification
+    uint8_t   ip_class;
+
+    // Constant stride: 2-bit confidence counter
+    uint8_t   cs_confidence;
+
+    // Complex stride: local delta history buffer
+    // Stores the last DELTA_HISTORY_LEN strides observed for this IP.
+    // Oldest at index 0, newest at index DELTA_HISTORY_LEN-1.
+    int64_t   delta_history[DELTA_HISTORY_LEN];
+    uint8_t   delta_count;  // how many deltas recorded so far (caps at DELTA_HISTORY_LEN)
+
+    IP_TRACKER () {
+        ip = 0;
+        last_cl_addr = 0;
+        last_stride = 0;
+        lru = 0;
+        ip_class = CLASS_NONE;
+        cs_confidence = 0;
+        delta_count = 0;
+        for (int i = 0; i < DELTA_HISTORY_LEN; i++)
+            delta_history[i] = 0;
+    };
+
+    void reset_tracker(uint64_t new_ip, uint64_t cl_addr) {
+        ip = new_ip;
+        last_cl_addr = cl_addr;
+        last_stride = 0;
+        ip_class = CLASS_NONE;
+        cs_confidence = 0;
+        delta_count = 0;
+        for (int i = 0; i < DELTA_HISTORY_LEN; i++)
+            delta_history[i] = 0;
+    }
+
+    // Add a delta to the history buffer (shift-left, newest at end)
+    void record_delta(int64_t delta) {
+        for (int i = 0; i < DELTA_HISTORY_LEN - 1; i++)
+            delta_history[i] = delta_history[i + 1];
+        delta_history[DELTA_HISTORY_LEN - 1] = delta;
+        if (delta_count < DELTA_HISTORY_LEN)
+            delta_count++;
+    }
+
+    // Search delta history for the shortest repeating cycle.
+    // Returns the cycle length (0 if no cycle found).
+    // Sets cycle_start_idx to the index in delta_history where the
+    // predicted next cycle begins (for walking the cycle during prefetch).
+    int find_cycle(int &cycle_start_idx) {
+        int n = delta_count;
+        if (n > DELTA_HISTORY_LEN) n = DELTA_HISTORY_LEN; // Prevent compiler warning
+        if (n < 2) return 0;
+
+        int end = DELTA_HISTORY_LEN; // buffer end (exclusive)
+
+        // Try cycle lengths from 1 to n/2
+        for (int len = 1; len <= n / 2; len++) {
+            bool match = true;
+            for (int j = 0; j < len; j++) {
+                if (delta_history[end - 1 - j] != delta_history[end - 1 - len - j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                // Cycle of length `len` found!
+                // The next stride in the cycle starts at delta_history[end - len]
+                cycle_start_idx = end - len;
+                return len;
+            }
+        }
+        return 0;
+    }
+};
+
+IP_TRACKER trackers[IP_TRACKER_COUNT];
+
+void CACHE::l1d_prefetcher_initialize()
 {
-    std::cout << "------------------------------------------------" << std::endl;
-    std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
-    std::cout << "------------------------------------------------" << std::endl;
+    cout << "CPU " << cpu << " L1D Stride Pattern Prefetcher (SPP v3)" << endl;
+    for (int i = 0; i < IP_TRACKER_COUNT; i++)
+        trackers[i].lru = i;
+    for (int i = 0; i < RECENT_PF_BUF_SIZE; i++)
+        spp_recent_pf_buf[i] = 0;
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+
+    // ---- Accuracy feedback ----
+    for (int i = 0; i < RECENT_PF_BUF_SIZE; i++) {
+        if (spp_recent_pf_buf[i] == cl_addr) {
+            spp_useful_hits++;
+            spp_recent_pf_buf[i] = 0;
+            break;
+        }
+    }
+
+    ip = ip & MASK_IP;
+
+    // ---- Find or allocate tracker ----
+    int index = -1;
+    for (index = 0; index < IP_TRACKER_COUNT; index++) {
+        if (trackers[index].ip == ip)
+            break;
+    }
+
+    if (index == IP_TRACKER_COUNT) {
+        for (index = 0; index < IP_TRACKER_COUNT; index++) {
+            if (trackers[index].lru == (IP_TRACKER_COUNT - 1))
+                break;
+        }
+        trackers[index].reset_tracker(ip, cl_addr);
+        for (int i = 0; i < IP_TRACKER_COUNT; i++) {
+            if (trackers[i].lru < trackers[index].lru)
+                trackers[i].lru++;
+        }
+        trackers[index].lru = 0;
+        return;
+    }
+
+    if (index == -1)
+        assert(0);
+
+    // ---- Compute stride ----
+    int64_t stride = 0;
+    if (cl_addr > trackers[index].last_cl_addr)
+        stride = cl_addr - trackers[index].last_cl_addr;
+    else {
+        stride = trackers[index].last_cl_addr - cl_addr;
+        stride *= -1;
+    }
+
+    if (stride == 0)
+        return;
+
+    // ---- Record delta in history ----
+    trackers[index].record_delta(stride);
+
+    // ---- IP Classification Logic ----
+    // Update constant stride confidence (2-bit hysteresis)
+    if (stride == trackers[index].last_stride) {
+        if (trackers[index].cs_confidence < CS_CONF_MAX)
+            trackers[index].cs_confidence++;
+    } else {
+        if (trackers[index].cs_confidence > 0)
+            trackers[index].cs_confidence--;
+    }
+
+    // Classify: constant stride takes priority over complex
+    if (trackers[index].cs_confidence >= CS_CONF_THRESH) {
+        trackers[index].ip_class = CLASS_CS;
+    } else if (trackers[index].delta_count >= 4) {
+        trackers[index].ip_class = CLASS_CPLX;
+    } else {
+        trackers[index].ip_class = CLASS_NONE;
+    }
+
+    // ---- Accuracy-based throttling ----
+    int current_degree = PREFETCH_DEGREE_MIN;
+    if (spp_total_issued > 16) {
+        uint64_t accuracy = (spp_useful_hits * 100) / spp_total_issued;
+        if (accuracy > HIGH_ACCURACY_THRESH) {
+            current_degree = PREFETCH_DEGREE_MAX;
+        } else if (accuracy > LOW_ACCURACY_THRESH) {
+            current_degree = PREFETCH_DEGREE_MAX - 1;
+        } else {
+            current_degree = PREFETCH_DEGREE_MIN;
+        }
+    }
+
+    // Decay counters
+    if (spp_total_issued > ACCURACY_DECAY_THRESH) {
+        spp_total_issued >>= 1;
+        spp_useful_hits  >>= 1;
+    }
+
+    // ---- Issue prefetches based on class ----
+
+    if (trackers[index].ip_class == CLASS_CS) {
+        // CONSTANT STRIDE: prefetch using the uniform stride (same as IP stride)
+        for (int i = 0; i < current_degree; i++) {
+            uint64_t pf_address = (cl_addr + (stride * (i + 1))) << LOG2_BLOCK_SIZE;
+
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                break;
+
+            if (MSHR.occupancy < (MSHR.SIZE >> 1))
+                prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+            else
+                prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+
+            spp_total_issued++;
+            spp_recent_pf_buf[spp_recent_pf_head] = pf_address >> LOG2_BLOCK_SIZE;
+            spp_recent_pf_head = (spp_recent_pf_head + 1) % RECENT_PF_BUF_SIZE;
+        }
+
+    } else if (trackers[index].ip_class == CLASS_CPLX) {
+        // COMPLEX STRIDE: search delta history for a repeating cycle
+        int cycle_start_idx = 0;
+        int cycle_len = trackers[index].find_cycle(cycle_start_idx);
+
+        if (cycle_len > 0) {
+            // Walk the cycle to issue multi-stride prefetches
+            // cycle_start_idx points to where the NEXT cycle begins in delta_history
+            uint64_t pf_cl = cl_addr;
+            for (int i = 0; i < current_degree; i++) {
+                int64_t step = trackers[index].delta_history[cycle_start_idx + (i % cycle_len)];
+                pf_cl += step;
+                uint64_t pf_address = pf_cl << LOG2_BLOCK_SIZE;
+
+                if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                    break;
+
+                if (MSHR.occupancy < (MSHR.SIZE >> 1))
+                    prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+                else
+                    prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+
+                spp_total_issued++;
+                spp_recent_pf_buf[spp_recent_pf_head] = pf_address >> LOG2_BLOCK_SIZE;
+                spp_recent_pf_head = (spp_recent_pf_head + 1) % RECENT_PF_BUF_SIZE;
+            }
+        }
+    }
+    // CLASS_NONE: no prefetch
+
+    trackers[index].last_cl_addr = cl_addr;
+    trackers[index].last_stride  = stride;
+
+    // Update LRU
+    for (int i = 0; i < IP_TRACKER_COUNT; i++) {
+        if (trackers[i].lru < trackers[index].lru)
+            trackers[i].lru++;
+    }
+    trackers[index].lru = 0;
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
 {
-	return; //metadata_in;
+    return;
 }
 
 void CACHE::l1d_prefetcher_final_stats()
 {
-
+    cout << "CPU " << cpu << " L1D SPP v3 final stats" << endl;
+    cout << "  SPP Total Issued:      " << spp_total_issued << endl;
+    cout << "  SPP Useful Hits:       " << spp_useful_hits << endl;
+    if (spp_total_issued > 0)
+        cout << "  SPP Internal Accuracy: " << (spp_useful_hits * 100.0 / spp_total_issued) << "%" << endl;
 }
